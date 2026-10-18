@@ -1,0 +1,93 @@
+---
+title: "Create annotation for enrichment analysis"
+author: "Raban van den Brand"
+date: "2026-10-18"
+output: html_document
+---
+## Creation of annotation information
+There is no official org.db package for honey bees so we need to create our own annotation information.
+
+```{r setup, include=FALSE}
+library(clusterProfiler)
+```
+
+## Setup
+
+Setup the supporting information needed
+
+```{r}
+options(timeout = 3600)
+
+taxid <- "7460"
+dir.create("annotation", showWarnings = FALSE)
+
+# Read a large gzipped NCBI table in chunks and keep only the honey bee rows
+# (base R only, works on Windows/macOS/Linux)
+filter_ncbi <- function(url, dest, taxid) {
+  if (!file.exists(dest)) download.file(url, dest, mode = "wb")
+  con <- gzfile(dest, "r"); on.exit(close(con))
+  pat  <- paste0("^", taxid, "\t")
+  keep <- character(0)
+  repeat {
+    chunk <- readLines(con, n = 500000)
+    if (length(chunk) == 0) break
+    keep <- c(keep, grep(pat, chunk, value = TRUE))
+  }
+  read.delim(text = keep, header = FALSE, sep = "\t", quote = "",
+             comment.char = "", fill = TRUE, stringsAsFactors = FALSE)
+}
+
+```
+
+## Add NCBI GENE IDs
+We need the NCBI GENE IDs to select the enrchichment terms.
+
+```{r}
+gi <- filter_ncbi(
+  "https://ftp.ncbi.nlm.nih.gov/gene/DATA/GENE_INFO/Invertebrates/All_Invertebrates.gene_info.gz",
+  "annotation/All_Invertebrates.gene_info.gz", taxid)
+gene_map <- data.frame(GeneID = as.character(gi$V2), Symbol = gi$V3,
+                       stringsAsFactors = FALSE)
+message("Honey bee genes in NCBI gene_info: ", nrow(gene_map))
+
+```
+
+## Select the GO terms
+now we can select the GO terms involved with apis mellifera, and save the annotation information for further analysis
+```{r}
+g2go <- filter_ncbi("https://ftp.ncbi.nlm.nih.gov/gene/DATA/gene2go.gz",
+                    "annotation/gene2go.gz", taxid)
+g2go <- g2go[!grepl("^NOT", g2go$V5), ]                    # drop negated annotations
+go   <- unique(data.frame(GeneID = as.character(g2go$V2), GO = g2go$V3,
+                          stringsAsFactors = FALSE))
+go   <- merge(go, gene_map, by = "GeneID")
+write.table(unique(go[, c("Symbol", "GO")]), "annotation_terms/gene2go.tsv", sep = "\t",
+            quote = FALSE, row.names = FALSE, col.names = FALSE)
+message("GO: ", length(unique(go$Symbol)), " genes, ",
+        length(unique(go$GO)), " GO terms")
+```
+
+## Select the KEGG terms
+We can do the same now for the KEGG pathways
+```{r}
+kk  <- download_KEGG("ame")
+p2g <- kk$KEGGPATHID2EXTID; colnames(p2g) <- c("path", "GeneID")
+p2n <- kk$KEGGPATHID2NAME;  colnames(p2n) <- c("path", "name")
+p2n$name  <- sub(" - Apis mellifera.*$", "", p2n$name)
+p2g$GeneID <- as.character(p2g$GeneID)
+kegg <- merge(merge(p2g, p2n, by = "path"), gene_map, by = "GeneID")
+write.table(unique(kegg[, c("Symbol", "path", "name")]), "annotation_terms/gene2kegg.tsv",
+            sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+message("KEGG: ", length(unique(kegg$Symbol)), " genes, ",
+        length(unique(kegg$path)), " pathways")
+```
+
+
+## Check the coverage
+Check the coverage of the found terms so we can see how many genes have terms related to them
+```{r}
+ids <- rownames(read.csv(file.path(getwd(),"gene_counts_matrix.csv"), row.names = 1, check.names = FALSE))
+message(sprintf("Your genes with GO annotation:   %d / %d (%.1f%%)",
+                sum(ids %in% go$Symbol), length(ids), 100 * mean(ids %in% go$Symbol)))
+message(sprintf("Your genes with KEGG annotation: %d / %d (%.1f%%)",
+                sum(ids %in% kegg$Symbol), length(ids), 100 * mean(ids %in% kegg$Symbol)))

@@ -1,0 +1,95 @@
+---
+title: "Pre-processing and QC"
+output: html_document
+date: "2026-10-18"
+---
+## Library import
+```{r}
+library("ShortRead")
+library("Rfastp")
+library("ggplot2")
+library("Rsubread")
+```
+
+## FastQ files
+The first step needed is the QC and trimming of the FastQ files
+under this is the example of how to do this on one file.
+
+```{r}
+se_json_report <- rfastp(read1 = file.path(getwd(),"FastQ","SRR3095866PE_1.fastq"), read2=file.path(getwd(),"FastQ","SRR3095866PE_2.fastq"),  outputFastq = paste0(file.path(getwd(),"FastQ","SRR3095866PE"),"postQC"), thread=4)
+
+dfsummary <- qcSummary(se_json_report)
+p1 <- curvePlot(se_json_report)
+
+p1
+```
+
+## BAM files
+
+First the BAM files need to be created for this 2 steps are needed to be run on a linux terminal using HISAT2.
+First the reference genome has to be created using the amel_HVA_3.1 ->
+# Extract splice sites and exons
+hisat2_extract_splice_sites.py GCF_003254395.2_Amel_HAv3.1_genomic.gtf > splicesites.txt
+hisat2_extract_exons.py GCF_003254395.2_Amel_HAv3.1_genomic.gtf > exons.txt
+
+# Build index with annotation guides
+hisat2-build -p 8 \
+  --ss splicesites.txt \
+  --exon exons.txt \
+  GCF_003254395.2_Amel_HAv3.1_genomic.fna \
+  Amel_HAv3.1_index
+
+Using the reference genome we can perform gene alignment and mapping, HISAT2 handles this in one step
+#gene alignment and mapping
+hisat2 -p 8 \
+  -x Amel_HAv3.1_index \
+  -1 sample_R1.trim.fastq.gz \
+  -2 sample_R2.trim.fastq.gz \
+  --dta \
+  --summary-file sample.align_summary.txt \
+  | samtools sort -@ 4 -o sample.sorted.bam -
+
+After creation of the bam files we need to do some checks to see the quality of the mapping and alignment
+
+```{r}
+bam_dir <- file.path(getwd(),"bam_files")
+bam_files <- list.files(bam_dir, pattern = "\\.sorted\\.bam$", full.names = TRUE)
+
+# Sanity check — make sure order and names are what you expect
+bam_files
+
+fc <- featureCounts(files = bam_files, annot.ext = file.path(getwd(),"ncbi_dataset/data/GCF_003254395.2/genomic.gtf"), isPairedEnd = TRUE, isGTFAnnotationFile = TRUE,
+                    GTF.featureType = "exon",
+                    GTF.attrType = "gene_id")
+
+
+#take the perfomance stats from the bam files
+stat_pct <- sweep(fc$stat[,-1], 2, colSums(fc$stat[,-1]), "/") * 100
+rownames(stat_pct) <- fc$stat$Status
+bam_qc_df_rnd <- data.frame(t(round(stat_pct, 1)))
+
+#Create the sample names
+bam_qc_df_rnd$samples <- gsub("\\.sorted\\.bam$", "", basename(colnames(counts)))
+
+
+ggplot(bam_qc_df_rnd, aes(x=samples, y=Assigned)) + 
+  geom_bar(stat = "identity",  fill = "steelblue") +
+  geom_hline(yintercept = 80, color = "red", linetype = "dashed", size = 1)
+```
+
+## Create count matrix
+save the count information for further processing
+```{r}
+# The actual count matrix: genes x samples
+counts <- fc$counts
+
+# Clean up column names (they'll be full BAM paths by default)
+colnames(counts) <- gsub("\\.sorted\\.bam$", "", basename(colnames(counts)))
+
+head(counts)
+dim(counts)   # genes x samples — sanity check
+
+
+#write function not used due to not all bam files included
+#write.csv(counts, path to save)
+```

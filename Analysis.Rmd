@@ -1,0 +1,364 @@
+---
+title: "Analysis"
+author: "Raban van den Brand"
+date: "2026-10-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(DESeq2)
+library(ggplot2)
+library(clusterProfiler)
+library(enrichplot)
+library(RCy3)
+library(simplifyEnrichment)
+library(pheatmap)
+library(dplyr)
+library(tidyverse)
+library(multiblock)
+```
+
+## Set up the settings for analysis
+
+```{r cars}
+ref_group  <- "QE"        # reference level for the design
+alpha      <- 0.05         # adjusted p-value cutoff for DEGs
+lfc_cutoff <- 1            # |log2FC| cutoff for DEGs
+
+contrasts <- list(         # c("group", numerator, denominator)
+  QE_vs_QL1  = c("group", "QE", "QL1"),
+  QE_vs_QL2  = c("group", "QE", "QL2"),
+  QE_vs_W = c("group", "QE", "W"),
+  W_vs_QL1 = c("group", "W", "QL1"),
+  W_vs_QL2 = c("group", "W", "QL2"),
+  QL1_vs_QL2 = c("group", "QL1", "QL2")
+)
+
+species   <- "Apis mellifera"
+key_type  <- "SYMBOL"
+kegg_code <- "ame"
+custom_files <- c( GO = file.path(getwd(),"enrichment_terms","gene2go.tsv"),
+  KEGG = file.path(getwd(),"enrichment_terms","gene2kegg.tsv"))
+
+
+enrich_p  <- 0.05   # adjusted p-value cutoff for enriched terms
+min_genes <- 5 
+
+counts <- read.csv(file.path(getwd(),"gene_counts_matrix.csv"), row.names = 1, check.names = FALSE)
+counts <- as.matrix(counts)
+mode(counts) <- "integer"
+```
+
+## Create Deseq2 object and run Deseq2
+```{r}
+dir.create("DEG_results")
+coldata <- data.frame(
+  row.names = colnames(counts),
+  group     = factor(sub("_.*", "", colnames(counts))),
+  sample_names = colnames(counts)
+)
+coldata$group <- relevel(coldata$group, ref = ref_group)
+print(coldata)
+
+dds <- DESeqDataSetFromMatrix(countData = counts, colData = coldata,
+                              design = ~ group)
+dds <- dds[rowSums(counts(dds) >= 10) >= 3, ]
+dds <- DESeq(dds)
+print(resultsNames(dds))
+
+results_list <- lapply(names(contrasts), function(nm) {
+  res    <- results(dds, contrast = contrasts[[nm]], alpha = alpha)
+  res_df <- as.data.frame(res)
+  res_df$gene <- rownames(res_df)
+  res_df <- res_df[order(res_df$padj), ]
+  write.csv(res_df, paste0("DEG_results/DESeq2_", nm, ".csv"), row.names = FALSE)
+  message(nm, ": ",
+          sum(res$padj < alpha & abs(res$log2FoldChange) >= lfc_cutoff, na.rm = TRUE),
+          " DEGs (padj < ", alpha, ", |log2FC| >= ", lfc_cutoff, ")")
+  res_df
+})
+names(results_list) <- names(contrasts)
+
+```
+
+## Create Volcano plots
+Create volcano plots as a visualization of the Differential gene expression analysis
+
+```{r}
+dir.create("DEG_results")
+vsd <- vst(dds, blind = TRUE)
+pdf("DEG_results/QC_plots.pdf", width = 7, height = 6)
+print(plotPCA(vsd, intgroup = "group") + theme_bw() + ggtitle("PCA (VST counts)"))
+plotDispEsts(dds)
+dev.off()
+
+volcano <- function(df, title) {
+  df$status <- "NS"
+  df$status[df$padj < alpha & df$log2FoldChange >=  lfc_cutoff] <- "Up"
+  df$status[df$padj < alpha & df$log2FoldChange <= -lfc_cutoff] <- "Down"
+  ggplot(df, aes(log2FoldChange, -log10(padj), colour = status)) +
+    geom_point(alpha = 0.6, size = 1) +
+    scale_colour_manual(values = c(Down = "blue", NS = "grey70", Up = "red")) +
+    geom_vline(xintercept = c(-lfc_cutoff, lfc_cutoff), linetype = "dashed") +
+    geom_hline(yintercept = -log10(alpha), linetype = "dashed") +
+    theme_bw() + ggtitle(title)
+}
+pdf("DEG_results/Volcano_plots.pdf", width = 7, height = 6)
+for (nm in names(results_list)) print(volcano(results_list[[nm]], nm))
+dev.off()
+
+```
+
+## Prepare annotation information for functional gene enrichment
+We need to load the previously created annotation information for the the functional gene enrichment 
+```{r}
+dir.create("enrichment", showWarnings = FALSE)
+
+library(GO.db)
+custom_sets <- lapply(names(custom_files), function(lbl) {
+  raw <- read.delim(custom_files[[lbl]], header = FALSE, quote = "",
+                    stringsAsFactors = FALSE)       # gene, term [, term name]
+  t2g <- unique(data.frame(term = raw[[2]], gene = raw[[1]],
+                           stringsAsFactors = FALSE))  # enricher wants term, gene
+  t2n <- NULL
+  if (ncol(raw) >= 3)
+    t2n <- unique(data.frame(term = raw[[2]], name = raw[[3]],
+                             stringsAsFactors = FALSE))
+  if (toupper(lbl) == "GO") {
+    nm <- AnnotationDbi::select(GO.db, keys = unique(t2g$term),
+                                columns = c("TERM", "ONTOLOGY"), keytype = "GOID")
+    t2n <- nm[, c("GOID", "TERM")]
+    # keep the three ontologies separate
+    sets <- lapply(c(BP = "BP", MF = "MF", CC = "CC"), function(ont) {
+      ids <- nm$GOID[nm$ONTOLOGY == ont]
+      list(t2g = t2g[t2g$term %in% ids, ], t2n = t2n)
+    })
+    return(setNames(sets, paste0("GO_", names(sets))))
+  }
+  setNames(list(list(t2g = t2g, t2n = t2n)), lbl)
+})
+custom_sets <- unlist(custom_sets, recursive = FALSE)
+# unlist() prefixes names (e.g. "GO.GO_BP") -> tidy up
+names(custom_sets) <- sub("^[^.]+\\.", "", names(custom_sets))
+```
+
+## Enrichment function
+Because we need to run the enrichment analysis once for every contrast between bee groups we create a function to handle the enrichment
+``` {r}
+run_enrichment <- function(genes, universe) {
+  out <- list()
+  for (lbl in names(custom_sets)) {
+    s <- custom_sets[[lbl]]
+    out[[lbl]] <- tryCatch(
+      enricher(gene = genes, universe = universe, TERM2GENE = s$t2g,
+               TERM2NAME = s$t2n, pAdjustMethod = "BH",
+               pvalueCutoff = enrich_p, qvalueCutoff = 0.2),
+      error = function(e) { message("  ", lbl, " failed: ", conditionMessage(e)); NULL })
+  }
+  
+  out
+}
+```
+
+
+## run the enrichment for every contrast
+we run seperate enrichment analysis for the up regulated genes down regulated genes and all differentially expressed genes to see what functions are linked with what group of genes
+```{r}
+all_enrich <- list()
+
+for (nm in names(results_list)) {
+  df       <- results_list[[nm]]
+  tested   <- !is.na(df$padj)
+  universe <- df$gene[tested]                       # background = all tested genes
+  deg_sets <- list(
+    up   = df$gene[tested & df$padj < alpha & df$log2FoldChange >=  lfc_cutoff],
+    down = df$gene[tested & df$padj < alpha & df$log2FoldChange <= -lfc_cutoff],
+    all  = df$gene[tested & df$padj < alpha & abs(df$log2FoldChange) >= lfc_cutoff]
+  )
+  
+  for (dir_nm in names(deg_sets)) {
+    genes <- deg_sets[[dir_nm]]
+    tag   <- paste(nm, dir_nm, sep = "_")
+    message("\n== ", tag, ": ", length(genes), " genes ==")
+    if (length(genes) < min_genes) { message("  too few genes, skipped"); next }
+    
+    res_enr <- run_enrichment(genes, universe)
+    all_enrich[[tag]] <- res_enr
+    
+    pdf(file.path("enrichment", paste0("plots_", tag, ".pdf")), width = 9, height = 7)
+    for (db in names(res_enr)) {
+      obj <- res_enr[[db]]
+      if (is.null(obj) || nrow(as.data.frame(obj)) == 0) next
+      write.csv(as.data.frame(obj),
+                file.path("enrichment", paste0(tag, "_", db, ".csv")), row.names = FALSE)
+      n_sig <- sum(as.data.frame(obj)$p.adjust < enrich_p)
+      message("  ", db, ": ", n_sig, " significant terms")
+      if (n_sig > 0) {
+        print(dotplot(obj, showCategory = 20, title = paste(tag, db)) + theme_bw())
+        print(barplot(obj, showCategory = 20, title = paste(tag, db)))
+      }
+    }
+    dev.off()
+  }
+}
+```
+
+## select and save only the differentially expressed genes
+```{r}
+DEG_count_QE_W <-length(results_list$QE_vs_W$gene[results_list$QE_vs_W$padj < alpha & abs(results_list$QE_vs_W$log2FoldChange) >= lfc_cutoff])
+DEG_count_QE_QL1 <-length(results_list$QE_vs_QL1$gene[results_list$QE_vs_QL1$padj < alpha & abs(results_list$QE_vs_QL1$log2FoldChange) >= lfc_cutoff])
+DEG_count_QE_QL2 <-length(results_list$QE_vs_QL2$gene[results_list$QE_vs_QL2$padj < alpha & abs(results_list$QE_vs_QL2$log2FoldChange) >= lfc_cutoff])
+DEG_count_QL1_QL2 <-length(results_list$QL1_vs_QL2$gene[results_list$QL1_vs_QL2$padj < alpha & abs(results_list$QL1_vs_QL2$log2FoldChange) >= lfc_cutoff])
+DEG_count_W_QL1 <-length(results_list$W_vs_QL1$gene[results_list$W_vs_QL1$padj < alpha & abs(results_list$W_vs_QL1$log2FoldChange) >= lfc_cutoff])
+DEG_count_W_QL2 <-length(results_list$W_vs_QL2$gene[results_list$W_vs_QL2$padj < alpha & abs(results_list$W_vs_QL2$log2FoldChange) >= lfc_cutoff])
+
+DEG_numbers <-c(DEG_count_QE_W,DEG_count_W_QL1,DEG_count_W_QL2,DEG_count_QE_QL1,DEG_count_QE_QL2,DEG_count_QL1_QL2)
+
+
+```
+
+## Create a histogram of the DEGs
+```{r}
+DEG_numbers_df <- data.frame(
+  row.names = c("QE_W","W_QL1","W_QL2","QE_QL1","QE_QL2","QL1_QL2"),
+  DEG_counts = c(DEG_count_QE_W,DEG_count_W_QL1,DEG_count_W_QL2,DEG_count_QE_QL1,DEG_count_QE_QL2,DEG_count_QL1_QL2)
+)
+
+ggplot(DEG_numbers_df, aes(x=rownames(DEG_numbers_df), y=DEG_numbers)) + 
+  geom_bar(stat = "identity", fill = "steelblue")
+```
+
+### Create DEG count Matrix and save it
+
+``` {r}
+DEG_QE_W <-results_list$QE_vs_W$gene[results_list$QE_vs_W$padj < alpha & abs(results_list$QE_vs_W$log2FoldChange) >= lfc_cutoff]
+DEG_QE_QL1 <-results_list$QE_vs_QL1$gene[results_list$QE_vs_QL1$padj < alpha & abs(results_list$QE_vs_QL1$log2FoldChange) >= lfc_cutoff]
+DEG_QE_QL2 <-results_list$QE_vs_QL2$gene[results_list$QE_vs_QL2$padj < alpha & abs(results_list$QE_vs_QL2$log2FoldChange) >= lfc_cutoff]
+DEG_QL1_QL2 <-results_list$QL1_vs_QL2$gene[results_list$QL1_vs_QL2$padj < alpha & abs(results_list$QL1_vs_QL2$log2FoldChange) >= lfc_cutoff]
+DEG_W_QL1 <-results_list$W_vs_QL1$gene[results_list$W_vs_QL1$padj < alpha & abs(results_list$W_vs_QL1$log2FoldChange) >= lfc_cutoff]
+DEG_W_QL2 <-results_list$W_vs_QL2$gene[results_list$W_vs_QL2$padj < alpha & abs(results_list$W_vs_QL2$log2FoldChange) >= lfc_cutoff]
+
+
+
+DEG_sel_list <- append(DEG_QE_W,DEG_QE_QL1)
+DEG_sel_list <- append(DEG_sel_list,DEG_QE_QL2)
+DEG_sel_list <- append(DEG_sel_list,DEG_QL1_QL2)
+DEG_sel_list <- append(DEG_sel_list,DEG_W_QL1)
+DEG_sel_list <- append(DEG_sel_list,DEG_W_QL2)
+
+
+DEG_counts <- counts[rownames(counts) %in% DEG_sel_list, ]
+
+write.csv(DEG_counts, file.path(getwd(),"DEG_results","DEG_counts_matrix.csv"))
+
+
+```
+
+
+## Create DEG PCA
+
+``` {r}
+DEG_dds <- DESeqDataSetFromMatrix(
+  countData = DEG_counts,
+  colData = coldata,
+  design = ~ group
+)
+
+
+
+DEG_dds <- DESeq(DEG_dds)
+
+DEG_dds <-estimateSizeFactors(DEG_dds)
+
+DEG_normalized_counts <-counts(DEG_dds, normalized=TRUE)
+
+head(DEG_normalized_counts)
+head(DEG_dds)
+
+
+
+rld <- rlog(DEG_dds, blind=TRUE)
+
+plotPCA(rld, intgroup='group', ntop=500)
+
+```
+
+
+## Create Heatmap
+``` {r}
+rld_mat <- assay(rld)
+sampleDists <- dist((t(rld_mat)))
+sampleDistMatrix <- as.matrix(sampleDists)
+
+head(sampleDistMatrix)
+head(coldata)
+rownames(coldata)
+ann_col <- coldata %>%
+  tibble::remove_rownames() %>%
+  column_to_rownames("sample_names") %>%
+  dplyr::select(group)
+
+pheatmap(sampleDistMatrix, annotation_col = ann_col)
+colnames(sampleDistMatrix)
+
+all(rownames(ann_col) %in% colnames(sampleDistMatrix))
+all(colnames(sampleDistMatrix) %in% rownames(ann_col))
+
+```
+
+## ASCA
+```{r}
+group  <- factor(sub("_.*", "", colnames(DEG_counts)))
+counts <- DEG_counts[rowSums(DEG_counts >= 10) >= 3, ]
+X      <- t(vst(counts, blind = TRUE))          # samples x genes (matrix)
+
+
+dat   <- data.frame(group = group, row.names = rownames(X))
+dat$Y <- X
+
+
+mod <- asca(Y ~ group, data = dat)              
+print(mod)
+summary(mod)                                    # variance explained per effect
+
+
+sc   <- scores(mod,      factor = 1)            # one row per group level (in level order)
+ld   <- loadings(mod,    factor = 1)            # genes x components
+proj <- proj <- scale(X, center = TRUE, scale = FALSE) %*% ld           # individual samples 
+
+
+cols <- seq_along(levels(group)) + 1           
+pdf("DEG_results/DEG_ASCA_multiblock_plots.pdf", width = 7, height = 6)
+plot(proj[, 1], proj[, 2], col = cols[group], pch = 19, cex = 1.3,
+     xlab = "Component 1", ylab = "Component 2", main = "ASCA group effect")
+points(sc[, 1], sc[, 2], col = cols, pch = 4, cex = 2.5, lwd = 3)   # group scores
+legend("topright", legend = c(levels(group), "Group score"),
+       col = c(cols, "black"), pch = c(rep(19, length(cols)), 4), bty = "n")
+loadingplot(mod, factor = 1)                    # genes, so no group legend needed
+dev.off()
+
+#representation in R
+plot(proj[, 1], proj[, 2], col = cols[group], pch = 19, cex = 1.3,
+     xlab = "Component 1", ylab = "Component 2", main = "ASCA group effect")
+points(sc[, 1], sc[, 2], col = cols, pch = 4, cex = 2.5, lwd = 3)   # group scores
+legend("topright", legend = c(levels(group), "Group score"),
+       col = c(cols, "black"), pch = c(rep(19, length(cols)), 4), bty = "n")
+
+
+```
+
+
+
+
+
+## viusalize STRING network in cytoscape
+an example of how to visualize one contrast in cytoscape
+``` {r}
+df_STRING <- results_list$QL1_vs_QL2
+net_genes <- df_STRING$gene[df_test$padj < alpha & abs(df_STRING$log2FoldChange) >= lfc_cutoff]
+cmd <- sprintf(
+  'string protein query query="%s" species="Apis mellifera" taxonID=7460 cutoff=%s limit=0',
+  paste(net_genes, collapse = ","), 0.7
+)
+commandsRun(cmd)
+```
